@@ -13,8 +13,6 @@ CLOUDGOAT_SCENARIOS = [
 ]
 
 app = Flask(__name__)
-# IMPORTANT: Since this is only accessible via a private VPN, we enable CORS for simplicity.
-# If this server were publicly accessible, you MUST restrict origins.
 CORS(app)
 
 # Helper function to execute shell commands
@@ -122,7 +120,5 @@ def whitelist_ip():
 
 
 if __name__ == '__main__':
-    # Ensure CloudGoat scenarios directory is available if necessary
-    # In a real environment, you'd run this with a production WSGI server like Gunicorn or uWSGI
     # For simplicity, we run the built-in Flask server on port 8000
     app.run(host='0.0.0.0', port=8000, debug=False)
