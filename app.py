@@ -1,13 +1,14 @@
 import os
 import subprocess
+import threading
+import uuid
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
 # --- Configuration ---
-# NOTE: CloudGoat should be installed and configured to run from the context
-# where this application is executed.
 CLOUDGOAT_PATH = "cloudgoat"
 CLOUDGOAT_SCENARIOS = [
+    "iam_enum_basics",
     "sns_secrets"
     # Add all other scenario names you want available here
 ]
@@ -15,37 +16,50 @@ CLOUDGOAT_SCENARIOS = [
 app = Flask(__name__)
 CORS(app)
 
-# Helper function to execute shell commands
+# --- Job Tracker ---
+# Stores job statuses. Format: { "job_id": {"status": "running"|"complete"|"failed", "output": ""} }
+# Note: Since this is in-memory, jobs will clear if the Flask server restarts. 
+# This is usually fine for lab environments.
+jobs = {}
+
+# --- Helper Functions ---
+
 def execute_cloudgoat_command(command_parts, input_data=None, timeout=900):
+    """Executes the shell command synchronously (used by threads and fast routes)."""
     try:
-        # Run the command and capture output (stdout and stderr)
         result = subprocess.run(
             [CLOUDGOAT_PATH] + command_parts,
-            input=input_data, # Input data for interactive commands
+            input=input_data,
             capture_output=True,
             text=True,
-            check=True, # Raise exception for non-zero exit codes
-            timeout=timeout # Timeout set by caller
+            check=True,
+            timeout=timeout
         )
-        # Return success with combined output
         return True, result.stdout + "\n" + result.stderr
     except subprocess.CalledProcessError as e:
-        # Handle non-zero exit codes (command failed)
-        error_output = f"Command failed with exit code {e.returncode}:\n"
-        error_output += f"STDOUT: {e.stdout}\n"
-        error_output += f"STDERR: {e.stderr}"
+        error_output = f"Command failed with exit code {e.returncode}:\nSTDOUT: {e.stdout}\nSTDERR: {e.stderr}"
         return False, error_output
     except subprocess.TimeoutExpired:
         return False, "Command timed out."
     except FileNotFoundError:
-        return False, f"Error: '{CLOUDGOAT_PATH}' command not found. Ensure CloudGoat is installed and in the system PATH."
+        return False, f"Error: '{CLOUDGOAT_PATH}' command not found. Ensure CloudGoat is installed."
     except Exception as e:
         return False, f"An unexpected error occurred: {str(e)}"
+
+def run_cloudgoat_in_background(job_id, command_parts, input_data=None):
+    """Runs the command in a thread and updates the global jobs dictionary."""
+    success, output = execute_cloudgoat_command(command_parts, input_data)
+    
+    if success:
+        jobs[job_id] = {"status": "complete", "output": output}
+    else:
+        jobs[job_id] = {"status": "failed", "output": output}
+
+# --- Routes ---
 
 @app.route('/')
 def serve_index():
     """Serves the frontend HTML file."""
-    # Assumes index.html is in the same directory as app.py
     return send_from_directory(os.path.dirname(os.path.abspath(__file__)), 'index.html')
 
 @app.route('/scenarios', methods=['GET'])
@@ -53,9 +67,18 @@ def get_scenarios():
     """Returns the list of available scenario names."""
     return jsonify(CLOUDGOAT_SCENARIOS)
 
+@app.route('/status/<job_id>', methods=['GET'])
+def check_job_status(job_id):
+    """Endpoint for the frontend to poll for job completion."""
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"success": False, "output": "Job not found or expired."}), 404
+    
+    return jsonify(job), 200
+
 @app.route('/create', methods=['POST'])
 def create_scenario():
-    """Handles the creation of a CloudGoat scenario."""
+    """Handles the creation of a CloudGoat scenario asynchronously."""
     data = request.json
     scenario_name = data.get('scenario')
 
@@ -64,17 +87,23 @@ def create_scenario():
 
     app.logger.info(f"Attempting to create scenario: {scenario_name}")
     
-    # Execute: cloudgoat create [scenario_name]
-    success, output = execute_cloudgoat_command(["create", scenario_name])
+    # 1. Generate a Job ID and record it as running
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": "running", "output": "Initiating Creation..."}
 
-    if success:
-        return jsonify({"success": True, "output": output}), 200
-    else:
-        return jsonify({"success": False, "output": output}), 500
+    # 2. Start the Terraform process in a background thread
+    thread = threading.Thread(
+        target=run_cloudgoat_in_background, 
+        args=(job_id, ["create", scenario_name])
+    )
+    thread.start()
+
+    # 3. Immediately return the Job ID so the proxy doesn't time out
+    return jsonify({"success": True, "job_id": job_id, "status": "running"}), 202
 
 @app.route('/destroy', methods=['POST'])
 def destroy_scenario():
-    """Handles the destruction of a CloudGoat scenario."""
+    """Handles the destruction of a CloudGoat scenario asynchronously."""
     data = request.json
     scenario_name = data.get('scenario')
 
@@ -83,20 +112,22 @@ def destroy_scenario():
 
     app.logger.info(f"Attempting to destroy scenario: {scenario_name}")
     
-    # FIX: Pass 'y' to the subprocess stdin to automatically confirm destruction
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": "running", "output": "Initiating Destruction..."}
+
     input_data = "y\n" 
     
-    # Execute: cloudgoat destroy [scenario_name]
-    success, output = execute_cloudgoat_command(["destroy", scenario_name], input_data=input_data)
+    thread = threading.Thread(
+        target=run_cloudgoat_in_background, 
+        args=(job_id, ["destroy", scenario_name], input_data)
+    )
+    thread.start()
 
-    if success:
-        return jsonify({"success": True, "output": output}), 200
-    else:
-        return jsonify({"success": False, "output": output}), 500
+    return jsonify({"success": True, "job_id": job_id, "status": "running"}), 202
 
 @app.route('/whitelist', methods=['POST'])
 def whitelist_ip():
-    """Handles the IP whitelisting using cloudgoat config whitelist."""
+    """Handles the IP whitelisting. Left synchronous as it executes quickly."""
     data = request.json
     ip_address = data.get('ip')
 
@@ -105,12 +136,7 @@ def whitelist_ip():
     
     app.logger.info(f"Attempting to whitelist IP: {ip_address}")
     
-    # Construct the input to automate 'y' response and IP entry
-    # Note: CloudGoat expects the input to be terminated by a newline.
     input_data = f"y\n{ip_address}\n"
-    
-    # Execute: cloudgoat config whitelist (with automated input)
-    # Set a short timeout as this command should be fast
     success, output = execute_cloudgoat_command(["config", "whitelist"], input_data=input_data, timeout=60)
 
     if success:
@@ -118,7 +144,5 @@ def whitelist_ip():
     else:
         return jsonify({"success": False, "output": output}), 500
 
-
 if __name__ == '__main__':
-    # For simplicity, we run the built-in Flask server on port 8000
     app.run(host='0.0.0.0', port=8000, debug=False)
